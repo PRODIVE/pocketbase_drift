@@ -53,11 +53,8 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
 
   StreamSubscription? _connectivitySubscription;
 
-  // Add a completer to track sync completion
-  // Initialize to an already completed state.
   Completer<void>? _syncCompleter = Completer<void>()..complete();
 
-  // Public getter to await sync completion
   Future<void> get syncCompleted => _syncCompleter?.future ?? Future.value();
 
   void _listenForConnectivityChanges() {
@@ -77,8 +74,6 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       logger.info('App resumed. Resetting connectivity subscription.');
       connectivity.resetSubscription();
-      // After resetting, the subscription will get the current state.
-      // We can also trigger a proactive sync if online.
       if (connectivity.isConnected) {
         logger.info(
             'App resumed and online. Checking for pending changes to sync.');
@@ -88,20 +83,17 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
   }
 
   Future<void> _retrySyncForAllServices() async {
-    // A sync is starting, create a new, un-completed completer.
     _syncCompleter = Completer<void>();
 
     try {
       // Query database to find services with pending records
-      // This ensures we sync even if service instances haven't been created yet
-      // Note: In SQLite, JSON booleans are stored as 0 (false) and 1 (true)
       final pendingServicesQuery = await db
           .customSelect("SELECT DISTINCT service FROM services WHERE "
               "json_extract(data, '\$.synced') = 0 AND "
               "(json_extract(data, '\$.noSync') IS NULL OR json_extract(data, '\$.noSync') = 0)")
           .get();
 
-      // Also get all services that have ANY records (for reconciliation)
+      // Get all services that have ANY records (for reconciliation)
       final allServicesQuery = await db
           .customSelect("SELECT DISTINCT service FROM services WHERE service != 'schema'")
           .get();
@@ -118,13 +110,10 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
         for (final row in pendingServicesQuery) {
           final serviceName = row.read<String>('service');
 
-          // Skip schema and any other system services
           if (serviceName == 'schema') continue;
 
-          // Get or create the service instance
           final service = collection(serviceName);
 
-          // Convert stream to future and collect all sync operations
           final future = service.retryLocal().last.then((_) {
             logger.fine('Push completed for service: $serviceName');
           });
@@ -171,29 +160,22 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
     }
   }
 
-  /// Generates a deterministic cache key for a given request.
-  /// Returns an empty string if the request method is not 'GET',
-  /// signifying that the request should not be cached.
   String _generateRequestCacheKey(
     String path, {
     String method = 'GET',
     Map<String, dynamic> query = const {},
     Map<String, dynamic> body = const {},
   }) {
-    // Only cache idempotent GET requests to avoid side effects.
     if (method.toUpperCase() != 'GET') {
       return '';
     }
 
-    // Sort maps to ensure the key is identical regardless of parameter order.
     final sortedQuery = SplayTreeMap.from(query);
     final sortedBody = SplayTreeMap.from(body);
 
-    // Combine all unique request components into a single string.
     return '$method::$path::${jsonEncode(sortedQuery)}::${jsonEncode(sortedBody)}';
   }
 
-  /// A list of path segments that should never be cached by [send].
   static const _nonCacheablePathSegments = [
     'api/backups',
     'api/batch',
@@ -206,12 +188,6 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
     'api/settings',
   ];
 
-  /// Sends a single HTTP request with offline caching capabilities.
-  ///
-  /// This method extends the base `send` method to provide offline caching
-  /// based on the provided [RequestPolicy]. Caching is enabled only for
-  /// "GET" requests. For other methods, or if files are being uploaded,
-  /// this method calls the original network-only implementation.
   @override
   Future<T> send<T extends dynamic>(
     String path, {
@@ -229,8 +205,6 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
       body: body,
     );
 
-    // Bypass cache if the key is empty (not a GET request), files are present,
-    // or the path contains a non-cacheable segment.
     final shouldBypassCache = _nonCacheablePathSegments.any(path.contains);
     if (cacheKey.isEmpty || files.isNotEmpty || shouldBypassCache) {
       return super.send<T>(
@@ -275,7 +249,6 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
           .map((item) => item as Map<String, dynamic>)
           .toList();
 
-      // Populate the local drift database with the schema.
       await db.setSchema(schema);
     } catch (e) {
       logger.severe('Error caching schema', e);
@@ -296,9 +269,6 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
     return service;
   }
 
-  /// Get a collection by id or name and fetch
-  /// the scheme to set it locally for use in
-  /// validation and relations
   Future<$RecordService> $collection(
     String collectionIdOrName, {
     RequestPolicy requestPolicy = RequestPolicy.cacheAndNetwork,
@@ -328,7 +298,6 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
   @override
   $FileService get files => $FileService(this);
 
-  // Clean up resources
   @override
   void close() {
     WidgetsBinding.instance.removeObserver(this);
@@ -336,50 +305,4 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
     connectivity.dispose();
     super.close();
   }
-
-  // @override
-  // $AdminsService get admins => $AdminsService(this);
-
-  // @override
-  // $RealtimeService get realtime => $RealtimeService(this);
-
-  // @override
-  // $SettingsService get settings => $SettingsService(this);
-
-  // @override
-  // $LogService get logs => $LogService(this);
-
-  // @override
-  // $HealthService get health => $HealthService(this);
-
-  // @override
-  // $BackupService get backups => $BackupService(this);
 }
-```
-
-## Key Changes
-
-The `_retrySyncForAllServices()` method now has two phases:
-
-### Phase 1: Push Local → Server
-- Same as before - pushes any pending local changes to the server using `retryLocal()`
-
-### Phase 2: Reconcile Server → Local (NEW)
-- Queries for ALL services that have records in the local database
-- Calls `reconcileWithServer()` on each service
-- This removes records that were deleted on the server while offline
-- Updates local cache with fresh server data
-
-## Sync Flow
-```
-Connectivity Restored
-        ↓
-Phase 1: Push Local Changes
-        ↓
-    retryLocal() for each service with pending changes
-        ↓
-Phase 2: Reconcile with Server
-        ↓
-    reconcileWithServer() for ALL services
-        ↓
-Full Sync Complete
