@@ -101,41 +101,67 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
               "(json_extract(data, '\$.noSync') IS NULL OR json_extract(data, '\$.noSync') = 0)")
           .get();
 
-      if (pendingServicesQuery.isEmpty) {
-        logger.info('No pending changes to sync.');
-        _syncCompleter!.complete();
-        return;
+      // Also get all services that have ANY records (for reconciliation)
+      final allServicesQuery = await db
+          .customSelect("SELECT DISTINCT service FROM services WHERE service != 'schema'")
+          .get();
+
+      final allServiceNames = allServicesQuery
+          .map((row) => row.read<String>('service'))
+          .toSet();
+
+      // Phase 1: Push local changes to server
+      if (pendingServicesQuery.isNotEmpty) {
+        logger.info('Phase 1: Pushing local changes to server...');
+        final pushFutures = <Future<void>>[];
+
+        for (final row in pendingServicesQuery) {
+          final serviceName = row.read<String>('service');
+
+          // Skip schema and any other system services
+          if (serviceName == 'schema') continue;
+
+          // Get or create the service instance
+          final service = collection(serviceName);
+
+          // Convert stream to future and collect all sync operations
+          final future = service.retryLocal().last.then((_) {
+            logger.fine('Push completed for service: $serviceName');
+          });
+          pushFutures.add(future);
+        }
+
+        if (pushFutures.isNotEmpty) {
+          await Future.wait(pushFutures);
+          logger.info('Phase 1 complete: All local changes pushed');
+        }
+      } else {
+        logger.info('Phase 1: No pending local changes to push');
       }
 
-      final futures = <Future<void>>[];
+      // Phase 2: Reconcile with server (pull deletions and updates)
+      if (allServiceNames.isNotEmpty) {
+        logger.info('Phase 2: Reconciling with server...');
+        final reconcileFutures = <Future<void>>[];
 
-      // Initialize service instances and sync for each service with pending records
-      for (final row in pendingServicesQuery) {
-        final serviceName = row.read<String>('service');
+        for (final serviceName in allServiceNames) {
+          final service = collection(serviceName);
 
-        // Skip schema and any other system services
-        if (serviceName == 'schema') continue;
+          final future = service.reconcileWithServer().then((_) {
+            logger.fine('Reconciliation completed for service: $serviceName');
+          }).catchError((e) {
+            logger.warning('Reconciliation failed for $serviceName: $e');
+          });
+          reconcileFutures.add(future);
+        }
 
-        // Get or create the service instance (this populates _recordServices)
-        final service = collection(serviceName);
-
-        // Convert stream to future and collect all sync operations
-        final future = service.retryLocal().last.then((_) {
-          logger.fine('Sync completed for service: $serviceName');
-        });
-        futures.add(future);
+        await Future.wait(reconcileFutures);
+        logger.info('Phase 2 complete: All services reconciled with server');
+      } else {
+        logger.info('Phase 2: No services to reconcile');
       }
 
-      if (futures.isEmpty) {
-        logger.info('No services to sync (only system records pending).');
-        _syncCompleter!.complete();
-        return;
-      }
-
-      // Wait for all services to complete their sync
-      await Future.wait(futures);
-      logger.info('All sync operations completed successfully');
-
+      logger.info('Full sync completed successfully');
       _syncCompleter!.complete();
     } catch (e) {
       logger.severe('Error during sync operations', e);
@@ -329,3 +355,31 @@ class $PocketBase extends PocketBase with WidgetsBindingObserver {
   // @override
   // $BackupService get backups => $BackupService(this);
 }
+```
+
+## Key Changes
+
+The `_retrySyncForAllServices()` method now has two phases:
+
+### Phase 1: Push Local → Server
+- Same as before - pushes any pending local changes to the server using `retryLocal()`
+
+### Phase 2: Reconcile Server → Local (NEW)
+- Queries for ALL services that have records in the local database
+- Calls `reconcileWithServer()` on each service
+- This removes records that were deleted on the server while offline
+- Updates local cache with fresh server data
+
+## Sync Flow
+```
+Connectivity Restored
+        ↓
+Phase 1: Push Local Changes
+        ↓
+    retryLocal() for each service with pending changes
+        ↓
+Phase 2: Reconcile with Server
+        ↓
+    reconcileWithServer() for ALL services
+        ↓
+Full Sync Complete
