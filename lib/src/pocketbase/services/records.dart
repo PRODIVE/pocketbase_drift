@@ -115,6 +115,83 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
     client.logger.info('Completed retry for service: $service');
   }
 
+  /// Reconciles local cache with server state.
+  /// 
+  /// This method handles the case where records were deleted on the server
+  /// while the device was offline. It:
+  /// 1. Fetches all records from the server
+  /// 2. Compares with local records
+  /// 3. Removes local records that no longer exist on the server
+  /// 4. Updates local cache with fresh server data
+  /// 
+  /// Note: This should be called AFTER [retryLocal] to ensure local pending
+  /// changes are pushed to the server first.
+  Future<void> reconcileWithServer({
+    String? filter,
+    String? expand,
+    Map<String, dynamic> query = const {},
+    Map<String, String> headers = const {},
+  }) async {
+    client.logger.info('Reconciling $service with server...');
+
+    try {
+      // 1. Get all records from server
+      final serverRecords = await getFullList(
+        requestPolicy: RequestPolicy.networkOnly,
+        filter: filter,
+        expand: expand,
+        query: query,
+        headers: headers,
+      );
+      final serverIds = serverRecords.map((r) => r.id).toSet();
+      client.logger.fine('Server has ${serverRecords.length} records');
+
+      // 2. Get all local records
+      final localRecords = await getFullList(
+        requestPolicy: RequestPolicy.cacheOnly,
+      );
+      client.logger.fine('Local cache has ${localRecords.length} records');
+
+      // 3. Find and remove local records that don't exist on server
+      int removedCount = 0;
+      for (final local in localRecords) {
+        final isSynced = local.data['synced'] == true;
+        final isDeleted = local.data['deleted'] == true;
+        final isNew = local.data['isNew'] == true;
+
+        // Only remove records that:
+        // - Were previously synced (not new local records)
+        // - Are not already marked for deletion
+        // - Don't exist on the server
+        if (isSynced && !isDeleted && !isNew && !serverIds.contains(local.id)) {
+          client.logger.fine('Removing ${local.id} (deleted on server)');
+          await client.db.$delete(service, local.id);
+          removedCount++;
+        }
+      }
+
+      // 4. Update local cache with fresh server data
+      for (final record in serverRecords) {
+        await client.db.$update(
+          service,
+          record.id,
+          {
+            ...record.toJson(),
+            'synced': true,
+            'deleted': false,
+            'isNew': false,
+          },
+        );
+      }
+
+      client.logger.info(
+          'Reconciliation complete for $service: removed $removedCount stale records, updated ${serverRecords.length} records');
+    } catch (e) {
+      client.logger.warning('Reconciliation failed for $service: $e');
+      rethrow;
+    }
+  }
+
   @override
   Future<UnsubscribeFunc> subscribe(
     String topic,
